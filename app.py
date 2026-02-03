@@ -18,23 +18,9 @@ def load_production_model():
 prod = load_production_model()
 
 # --- 2. DATA & MATH ---
-def get_live_data():
-    # Try Binance, fallback to OKX
-    try:
-        ex = ccxt.binance({'enableRateLimit': True})
-        ohlcv = ex.fetch_ohlcv('BTC/USDT', '15m', limit=100)
-    except:
-        ex = ccxt.okx({'enableRateLimit': True})
-        ohlcv = ex.fetch_ohlcv('BTC/USDT', '15m', limit=100)
-    
-    df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-    df['datetime'] = pd.to_datetime(df['ts'], unit='ms')
-    return df.set_index('datetime')
-
 def calculate_factors(df):
     d = df.copy()
     feat = pd.DataFrame(index=d.index)
-    # Re-calculate the 158 factors manually in Pandas
     feat['KMID'] = (d['close'] - d['open']) / d['open']
     feat['KLEN'] = (d['high'] - d['low']) / d['open']
     feat['KMID2'] = (d['close'] - d['open']) / (d['high'] - d['low'] + 1e-12)
@@ -45,23 +31,29 @@ def calculate_factors(df):
         feat[f'VMA{w}'] = d['volume'].rolling(w).mean() / (d['volume'] + 1e-12)
         feat[f'CORR{w}'] = d['close'].rolling(w).corr(np.log1p(d['volume']))
     
-    # Critical: Use the exact columns and order from the training session
-    return feat[prod['feature_names']].ffill().bfill()
+    # PROACTIVE FIX: Only use columns that exist in BOTH our math and the model's memory
+    # This filters out 'label' or '4h_return' from the required list
+    valid_features = [f for f in prod['feature_names'] if f in feat.columns]
+    return feat[valid_features].ffill().bfill()
 
 # --- 3. INFERENCE ---
 def run_prediction():
     data_df = get_live_data()
     feats = calculate_factors(data_df)
     
-    # scaling: (X - Mean) / Std
-    x_scaled = (feats - prod['mean']) / (prod['std'] + 1e-12)
+    # PROACTIVE FIX: Align the Mean and Std stats to match our actual features
+    # This prevents 'Label' from poisoning the subtraction math
+    model_mean = prod['mean'][feats.columns]
+    model_std = prod['std'][feats.columns]
+    
+    # Scaling
+    x_scaled = (feats - model_mean) / (model_std + 1e-12)
     x_scaled = x_scaled.clip(-3, 3)
     
     all_preds = []
     for booster in prod['boosters']:
         all_preds.append(booster.predict(x_scaled.values))
     
-    # Average the ensemble
     final_score = np.mean(all_preds, axis=0)
     return data_df, final_score[-1]
 
