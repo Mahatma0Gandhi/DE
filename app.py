@@ -3,43 +3,32 @@ import ccxt
 import pandas as pd
 import numpy as np
 import pickle
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="BTC 4H Predictor", layout="wide", page_icon="🚀")
-st.title("🚀 Bitcoin 4-Hour Alpha Predictor")
+# --- 1. SETUP ---
+st.set_page_config(page_title="BTC Alpha Live", layout="wide")
 
 @st.cache_resource
 def load_assets():
     with open('btc_production_model.pkl', 'rb') as f:
         return pickle.load(f)
 
-# Load variables into memory
 prod = load_assets()
-boosters = prod['boosters']
-feature_names = prod['feature_names']
 
-# --- 2. DATA FETCHING ---
+# --- 2. THE HARDENED ENGINE ---
 def get_live_data():
-    # Attempt Binance, fallback to OKX
-    try:
-        ex = ccxt.binance({'enableRateLimit': True})
-        ohlcv = ex.fetch_ohlcv('BTC/USDT', '15m', limit=100)
-    except:
-        ex = ccxt.okx({'enableRateLimit': True})
-        ohlcv = ex.fetch_ohlcv('BTC/USDT', '15m', limit=100)
-    
+    # Force fresh data by using a timestamp parameter
+    ex = ccxt.okx()
+    ohlcv = ex.fetch_ohlcv('BTC/USDT', '15m', limit=200)
     df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['ts'], unit='ms')
-    df['instrument'] = 'BTC'
-    return df.set_index(['datetime', 'instrument'])
+    # Use only datetime as index for simplicity and sort it!
+    df = df.set_index('datetime').sort_index()
+    return df
 
-# --- 3. FACTOR CALCULATION ---
 def calculate_factors(df):
     d = df.copy()
     feat = pd.DataFrame(index=d.index)
-    # Manual Technical Factors
     feat['KMID'] = (d['close'] - d['open']) / d['open']
     feat['KLEN'] = (d['high'] - d['low']) / d['open']
     feat['KMID2'] = (d['close'] - d['open']) / (d['high'] - d['low'] + 1e-12)
@@ -50,75 +39,63 @@ def calculate_factors(df):
         feat[f'VMA{w}'] = d['volume'].rolling(w).mean() / (d['volume'] + 1e-12)
         feat[f'CORR{w}'] = d['close'].rolling(w).corr(np.log1p(d['volume']))
     
-    # Proactive Filter: Only use features present in the trained model
-    # (Excludes 'label' if it was saved in the names list)
-    valid_cols = [c for c in feature_names if c in feat.columns]
+    # Ensure column alignment with production model
+    valid_cols = [c for c in prod['feature_names'] if c in feat.columns]
     return feat[valid_cols].ffill().bfill()
 
-# --- 4. INFERENCE ENGINE ---
 def run_prediction():
-    # Get raw data
-    data_raw = get_live_data()
-    # Calculate factors
-    feats = calculate_factors(data_raw)
+    data_df = get_live_data()
+    feats = calculate_factors(data_df)
     
-    # Scale Data (X - Mean) / Std
-    # We use .values to ensure alignment with the numpy boosters
-    # We ensure Mean/Std match the exact columns being used
-    m = pd.Series(prod['mean'], index=feature_names)[feats.columns].values
-    s = pd.Series(prod['std'], index=feature_names)[feats.columns].values
-    
-    x_scaled = (feats.values - m) / (s + 1e-12)
-    x_scaled = np.clip(x_scaled, -3, 3)
+    # Scale Data
+    m = pd.Series(prod['mean'], index=prod['feature_names'])[feats.columns].values
+    s = pd.Series(prod['std'], index=prod['feature_names'])[feats.columns].values
+    x_scaled = np.clip((feats.values - m) / (s + 1e-12), -3, 3)
     
     # Ensemble Prediction
-    preds = []
-    for booster in boosters:
-        preds.append(booster.predict(x_scaled))
+    all_preds = []
+    for booster in prod['boosters']:
+        all_preds.append(booster.predict(x_scaled))
     
-    final_signal = np.mean(preds, axis=0)
+    # This results in a 1D array of signals for the last 200 candles
+    final_signals = np.mean(all_preds, axis=0)
     
-    return data_raw, final_signal[-1]
+    # Create a clean signal series
+    sig_series = pd.Series(final_signals, index=data_df.index)
+    return data_df, sig_series
 
-# --- 5. USER INTERFACE ---
+# --- 3. UI ---
+st.title("🚀 Bitcoin 4-Hour Alpha Predictor")
+
 try:
-    # Run the full pipeline
-    data, latest_sig = run_prediction()
+    data, sigs = run_prediction()
     
-    current_price = data['close'].iloc[-1]
-    target_price = current_price * (1 + latest_sig)
-    last_ts = data.index.get_level_values(0)[-1]
-    target_time = (last_ts + timedelta(hours=4)).strftime('%H:%M')
+    # GRAB LATEST
+    curr_p = data['close'].iloc[-1]
+    latest_sig = sigs.iloc[-1]
+    target_p = curr_p * (1 + latest_sig)
+    last_ts = data.index[-1]
 
-    # Top Metric Bar
     col1, col2, col3 = st.columns(3)
-    col1.metric("Live BTC Price", f"${current_price:,.2f}")
-    col2.metric("4H Prediction", f"{latest_sig*100:.3f}%", delta=f"{latest_sig*100:.4f}%")
-    col3.metric(f"Target (at {target_time} UTC)", f"${target_price:,.2f}")
+    col1.metric("Live Price", f"${curr_p:,.2f}")
+    # Delta shows change from previous 15m candle
+    col2.metric("4H Prediction", f"{latest_sig*100:.4f}%", delta=f"{(latest_sig - sigs.iloc[-2])*100:.4f}%")
+    col3.metric("Target Price (4H)", f"${target_p:,.2f}")
 
-    # Candlestick Chart
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=data.index.get_level_values(0),
-        open=data['open'], high=data['high'],
-        low=data['low'], close=data['close'], name='BTC'
-    ))
+    # THE "SMOKING GUN" TABLE
+    st.subheader("📊 Live Signal Momentum (Compare to Colab)")
+    # Show the last 5 signals like your Colab log
+    history_df = pd.DataFrame({
+        'Price': data['close'],
+        'Signal %': sigs * 100
+    }).tail(10)
+    st.table(history_df.style.format({'Price': '{:,.2f}', 'Signal %': '{:,.4f}%'}))
 
-    # Projection Line
-    fig.add_trace(go.Scatter(
-        x=[last_ts, last_ts + timedelta(hours=4)],
-        y=[current_price, target_price],
-        line=dict(color='orange', width=4, dash='dot'),
-        name="4H Forecast"
-    ))
-
-    fig.update_layout(template='plotly_dark', xaxis_rangeslider_visible=False, height=600)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(f"Last data point: {last_ts} UTC. Prediction logic: DoubleEnsemble (6 models).")
+    # FOOTER
+    st.caption(f"Last sync: {last_ts} UTC | Dashboard Time: {datetime.now().strftime('%H:%M:%S')} IST")
 
 except Exception as e:
-    st.error(f"Inference Engine Error: {e}")
+    st.error(f"Engine Error: {e}")
 
-if st.button('🔄 Refresh Real-Time Data'):
+if st.button('🔄 Sync Data Now'):
     st.rerun()
